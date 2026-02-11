@@ -1,0 +1,280 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+
+# -------------------- Parameters --------------------
+field_size = 100
+num_nodes = 1000
+sink = (50,50)
+sensing_radius = 10
+comm_radius = 15
+rounds = 2000
+packet_size = 4000  # bits
+
+# Energy Model
+E_elec = 50e-9
+E_amp = 100e-12
+
+# -------------------- Deployment --------------------
+np.random.seed(50)
+node_positions = np.random.rand(num_nodes, 2) * field_size
+node_energy = np.full(num_nodes, 0.5)
+
+# -------------------- Coverage Hole Detection --------------------
+def is_covered(point, nodes, radius):
+    return np.any(np.linalg.norm(nodes - point, axis=1) <= radius)
+
+def detect_coverage_holes(nodes, radius, grid_res=5):
+    x = np.arange(0, field_size, grid_res)
+    y = np.arange(0, field_size, grid_res)
+    xx, yy = np.meshgrid(x, y)
+    grid_points = np.vstack((xx.ravel(), yy.ravel())).T
+    coverage = np.array([is_covered(p, nodes, radius) for p in grid_points])
+    holes = np.sum(~coverage)
+    return holes, coverage, grid_points
+
+# -------------------- Healing by Repositioning --------------------
+def reposition_nodes(nodes, uncovered_points, radius, move_dist=2):
+    if len(uncovered_points) == 0 or len(nodes) == 0:
+        return nodes
+    new_nodes = nodes.copy()
+    for p in uncovered_points:
+        dists = np.linalg.norm(new_nodes - p, axis=1)
+        if len(dists) == 0:
+            continue
+        idx = np.argmin(dists)
+        direction = (p - new_nodes[idx])
+        norm = np.linalg.norm(direction)
+        if norm == 0:
+            continue
+        direction /= norm
+        move = direction * min(move_dist, norm)
+        new_nodes[idx] = np.clip(new_nodes[idx] + move, 0, field_size)
+    return new_nodes
+
+# -------------------- Deployment Plot Function --------------------
+def plot_nodes_with_CH(nodes, CH_indices, sink, sensing_radius, holes_coords=None, title="Node Deployment"):
+    plt.figure(figsize=(6,6))
+    normal_idx = np.array([i for i in range(len(nodes)) if i not in CH_indices])
+    if len(normal_idx) > 0:
+        plt.scatter(nodes[normal_idx,0], nodes[normal_idx,1], c='blue', label='Nodes')
+    if len(CH_indices) > 0:
+        plt.scatter(nodes[CH_indices,0], nodes[CH_indices,1], c='green', marker='^', s=100, label='Cluster Heads')
+    plt.scatter(*sink, c='red', marker='x', label='Sink')
+    for node in nodes:
+        circle = plt.Circle((node[0], node[1]), sensing_radius, color='blue', alpha=0.1)
+        plt.gca().add_patch(circle)
+    if holes_coords is not None and holes_coords.size > 0:
+        plt.scatter(holes_coords[:,0], holes_coords[:,1], c='red', s=15, label='Coverage Holes')
+    plt.title(title)
+    plt.xlabel("X Position")
+    plt.ylabel("Y Position")
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+# -------------------- Simulation Setup --------------------
+initial_holes, initial_coverage, grid_points = detect_coverage_holes(node_positions, sensing_radius)
+FND = HND = LND = None
+milestones = {0.75: None, 0.50: None, 0.25: None, 0: None, 'FND': None}
+metrics = []
+node_CH_count = np.zeros(num_nodes, dtype=int)
+node_CH_energy = np.zeros(num_nodes)
+node_member_energy = np.zeros(num_nodes)
+CH_log = []
+
+# -------------------- Simulation Loop --------------------
+for r in range(rounds):
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+
+    if FND is None and len(alive_idx) < num_nodes:
+        FND = r + 1
+        milestones['FND'] = {'round': FND, 'nodes': alive_nodes.copy()}
+
+    if HND is None and len(alive_idx) <= num_nodes * 0.5:
+        HND = r + 1
+    if LND is None and len(alive_idx) <= num_nodes * 0.1:
+        LND = r + 1
+
+    # LEACH Cluster Head Selection
+    p = 0.1
+    is_CH = (np.random.rand(num_nodes) < p) & (node_energy > 0)
+    CH_indices = np.where(is_CH)[0]
+    node_CH_count[CH_indices] += 1
+    num_CH = len(CH_indices)
+
+    if num_CH > 0:
+        dists = np.linalg.norm(node_positions[:, None] - node_positions[CH_indices], axis=2)
+        assigned_CH = np.argmin(dists, axis=1)
+    else:
+        assigned_CH = np.zeros(num_nodes, dtype=int)
+
+    delay_round = []
+    energy_start = node_energy.copy()
+    ch_energy_consumed = 0.0
+
+    for i in range(num_nodes):
+        if node_energy[i] <= 0:
+            delay_round.append(0)
+            continue
+        if is_CH[i]:
+            rx_cost = E_elec * packet_size * (num_nodes / num_CH) if num_CH else 0
+            d_sink = np.linalg.norm(node_positions[i] - sink)
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_sink ** 2
+            total_cost = rx_cost + tx_cost
+            node_energy[i] -= total_cost
+            ch_energy_consumed += total_cost
+            node_CH_energy[i] += total_cost
+            delay_round.append(1 + d_sink / 10)
+            CH_log.append({
+                'Round': r+1, 'Node': i, 'x': node_positions[i][0], 'y': node_positions[i][1],
+                'Energy Start': energy_start[i], 'Energy End': node_energy[i], 'Energy Spent': total_cost
+            })
+        else:
+            ch = CH_indices[assigned_CH[i]] if num_CH > 0 else 0
+            d_ch = np.linalg.norm(node_positions[i] - node_positions[ch])
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_ch ** 2
+            node_energy[i] -= tx_cost
+            node_member_energy[i] += tx_cost
+            delay_round.append(1 + d_ch / 10)
+
+    total_energy_consumed = np.sum(energy_start - node_energy)
+    throughput = len(alive_idx)
+
+    # Coverage holes before healing
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+    holes_before, coverage_before, _ = detect_coverage_holes(alive_nodes, sensing_radius)
+    uncovered_points = grid_points[~coverage_before]
+
+    # Healing
+    healed_nodes = reposition_nodes(alive_nodes, uncovered_points, sensing_radius)
+    node_positions[alive_idx] = healed_nodes
+
+    holes_after, coverage_after, _ = detect_coverage_holes(healed_nodes, sensing_radius)
+
+    alive_ratio = len(alive_idx) / num_nodes
+    for ratio in [0.75, 0.50, 0.25, 0]:
+        if milestones[ratio] is None and alive_ratio <= ratio:
+            milestones[ratio] = {'round': r+1, 'nodes': healed_nodes.copy(), 'coverage': coverage_after.copy(), 'holes': holes_after}
+
+    metrics.append({
+        'Round': r + 1,
+        'Cluster Heads': num_CH,
+        'Energy Consumed': total_energy_consumed,
+        'CH Energy Consumed': ch_energy_consumed,
+        'Total Energy Spent': total_energy_consumed,
+        'Average Delay': np.mean([d for d in delay_round if d > 0]) if any(d > 0 for d in delay_round) else 0,
+        'Throughput': throughput,
+        'Alive Nodes': len(alive_idx),
+        'Holes Before Healing': holes_before,
+        'Holes After Healing': holes_after,
+        'CH Indices': CH_indices.copy()
+    })
+
+    if len(alive_idx) == 0:
+        break
+
+# -------------------- Initial Deployment with CHs --------------------
+initial_CH_indices = np.where(node_energy > 0)[0][:max(1, int(0.1*num_nodes))]
+plot_nodes_with_CH(node_positions, initial_CH_indices, sink, sensing_radius, title="Initial Deployment with CHs")
+
+# -------------------- Milestone Plots --------------------
+for key, data in milestones.items():
+    if data is None: continue
+    nodes = data['nodes']
+    CH_indices = [i for i in range(len(nodes)) if i in metrics[data['round']-1]['CH Indices']] if data['round']-1 < len(metrics) else []
+    holes_coords = grid_points[~data['coverage']] if 'coverage' in data else np.array([])
+    plot_nodes_with_CH(nodes, CH_indices, sink, sensing_radius, holes_coords, title=f"Coverage at Milestone {key} - Round {data['round']}")
+
+# -------------------- Metric Plots --------------------
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Alive Nodes'] for m in metrics], 'b-')
+plt.title("Alive Nodes Over Rounds"); plt.xlabel("No Of Rounds"); plt.ylabel("No of Alive Nodes"); plt.grid(True); plt.show()
+
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Energy Consumed'] for m in metrics], 'm-')
+plt.title("Energy Consumed Over Rounds"); plt.xlabel("No of Rounds"); plt.ylabel("Energy Consumed (J)"); plt.grid(True); plt.show()
+
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Holes Before Healing'] for m in metrics], 'r-', label="Before Healing")
+plt.plot([m['Round'] for m in metrics], [m['Holes After Healing'] for m in metrics], 'g-', label="After Healing")
+plt.title("Coverage Holes Over Rounds"); plt.xlabel("No of Rounds"); plt.ylabel("No of Coverage Holes"); plt.legend(); plt.grid(True); plt.show()
+
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Throughput'] for m in metrics], 'c-')
+plt.title("Throughput vs Rounds"); plt.xlabel("No of Rounds"); plt.ylabel("Throughput (Packets) %"); plt.grid(True); plt.show()
+
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Average Delay'] for m in metrics], 'orange')
+plt.title("Average Delay vs Rounds"); plt.xlabel("No of Rounds"); plt.ylabel("Average Delay (s)"); plt.grid(True); plt.show()
+
+plt.figure()
+plt.plot([m['Round'] for m in metrics], [m['Cluster Heads'] for m in metrics], 'purple')
+plt.title("Number of CHs per Round"); plt.xlabel("No of Rounds"); plt.ylabel("Number of CHs Selected"); plt.grid(True); plt.show()
+
+plt.figure()
+avg_energy_per_round = [np.mean(node_energy) for _ in metrics]
+plt.plot([m['Round'] for m in metrics], avg_energy_per_round, 'brown')
+plt.title("Average Node Energy vs Rounds"); plt.xlabel("No of Rounds"); plt.ylabel("Average Energy Consumed (J)"); plt.grid(True); plt.show()
+
+plt.figure()
+coverage_ratio_before = [m['Holes Before Healing'] / (field_size**2 / 25**2) for m in metrics]
+coverage_ratio_after = [m['Holes After Healing'] / (field_size**2 / 25**2) for m in metrics]
+plt.plot([m['Round'] for m in metrics], coverage_ratio_before, 'r-', label="Before Healing")
+plt.plot([m['Round'] for m in metrics], coverage_ratio_after, 'g-', label="After Healing")
+plt.title("Coverage Hole Ratio vs Rounds"); plt.xlabel("Round"); plt.ylabel("Coverage Hole Ratio"); plt.legend(); plt.grid(True); plt.show()
+
+# -------------------- CSV Export --------------------
+csv_filename = "leach_healing_detailed.csv"
+with open(csv_filename, mode='w', newline='') as f:
+    fieldnames = ['Round', 'Cluster Heads', 'Energy Consumed (J)', 'CH Energy Consumed (J)',
+                  'Total Energy Spent (J)', 'Avg Delay', 'Throughput', 'Alive Nodes',
+                  'Holes Before', 'Holes After', 'Coverage Ratio Before', 'Coverage Ratio After']
+    writer = csv.DictWriter(f,fieldnames=fieldnames)
+    writer.writeheader()
+    for m in metrics:
+        writer.writerow({
+            'Round': m['Round'],
+            'Cluster Heads': m['Cluster Heads'],
+            'Energy Consumed (J)': m['Energy Consumed'],
+            'CH Energy Consumed (J)': m['CH Energy Consumed'],
+            'Total Energy Spent (J)': m['Total Energy Spent'],
+            'Avg Delay': m['Average Delay'],
+            'Throughput': m['Throughput'],
+            'Alive Nodes': m['Alive Nodes'],
+            'Holes Before': m['Holes Before Healing'],
+            'Holes After': m['Holes After Healing'],
+            'Coverage Ratio Before': m['Holes Before Healing'] / (field_size**2 / 25**2),
+            'Coverage Ratio After': m['Holes After Healing'] / (field_size**2 / 25**2)
+        })
+print(f"Extended detailed metrics saved to '{csv_filename}'")
+
+# -------------------- Overall Metrics --------------------
+initial_coverage_holes = initial_holes
+FND_holes = milestones['FND']['holes'] if milestones['FND'] and 'holes' in milestones['FND'] else None
+HND_holes = milestones.get(0.50, {}).get('holes', None)
+LND_holes = milestones.get(0.10, {}).get('holes', None)
+final_holes = milestones.get(0, {}).get('holes', None)
+
+overall_throughput = np.sum([m['Throughput'] for m in metrics])
+overall_delay = np.mean([m['Average Delay'] for m in metrics])
+overall_energy = np.sum([m['Energy Consumed'] for m in metrics])
+initial_coverage_ratio = initial_coverage_holes / (field_size**2 / 25**2)
+final_coverage_ratio = final_holes / (field_size**2 / 25**2) if final_holes is not None else None
+healing_ratio = 1 - final_coverage_ratio / initial_coverage_ratio if final_coverage_ratio is not None else None
+
+print("\n-------------------- Overall Metrics --------------------")
+print(f"Initial Coverage Holes: {initial_coverage_holes}")
+print(f"Coverage Holes after FND: {FND_holes}")
+print(f"Coverage Holes at HND: {HND_holes}")
+print(f"Coverage Holes at LND: {LND_holes}")
+print(f"Final Coverage Holes (all nodes dead): {final_holes}")
+print(f"Total Energy Consumed: {overall_energy:.6f} J")
+print(f"Overall Throughput: {overall_throughput} packets")
+print(f"Average Delay: {overall_delay:.6f} s")
+print(f"Initial Coverage Ratio: {initial_coverage_ratio:.6f}")
+print(f"Final Coverage Ratio: {final_coverage_ratio:.6f}" if final_coverage_ratio is not None else "Final Coverage Ratio: N/A")
+print(f"Healing Ratio: {healing_ratio:.6f}" if healing_ratio is not None else "Healing Ratio: N/A")
