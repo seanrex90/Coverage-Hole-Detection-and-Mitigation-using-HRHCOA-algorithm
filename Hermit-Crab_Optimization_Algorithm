@@ -1,0 +1,166 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+import os
+
+# ---------------- Parameters ----------------
+field_size = 100
+num_nodes = 1000
+sink = np.array([50, 50])
+sensing_radius = 10
+comm_radius = 15
+rounds = 1500   # reduced for demo, can use 1500
+packet_size = 4000  # bits
+
+E_elec = 50e-9
+E_amp = 100e-12
+
+p = 0.1  # CH probability
+
+# Output directory
+output_dir = "wsn_probabilistic_outputs"
+os.makedirs(output_dir, exist_ok=True)
+
+# ---------------- Node Deployment ----------------
+np.random.seed(50)
+node_positions = np.random.rand(num_nodes, 2) * field_size
+node_energy = np.full(num_nodes, 0.5)
+
+# ---------------- Coverage Grid ----------------
+grid_res = 5
+x = np.arange(0, field_size, grid_res)
+y = np.arange(0, field_size, grid_res)
+xx, yy = np.meshgrid(x, y)
+grid_points = np.vstack((xx.ravel(), yy.ravel())).T
+
+def is_covered(point, nodes, radius):
+    return np.any(np.linalg.norm(nodes - point, axis=1) <= radius)
+
+# ---------------- Healing Function ----------------
+def hcoa_node_placement(uncovered_points, radius, add_count=5):
+    """Simplified HCOA-like node placement in uncovered regions."""
+    if len(uncovered_points) == 0:
+        return np.empty((0, 2))
+    selected = uncovered_points[np.random.choice(len(uncovered_points),
+                                                size=min(add_count, len(uncovered_points)),
+                                                replace=False)]
+    return selected
+
+# ---------------- Simulation ----------------
+round_metrics = []
+
+for r in range(rounds):
+    # ---- CH Selection (probabilistic) ----
+    is_CH = (np.random.rand(num_nodes) < p) & (node_energy > 0)
+    CH_indices = np.where(is_CH)[0]
+    num_CH = len(CH_indices)
+
+    if num_CH > 0:
+        dists = np.linalg.norm(node_positions[:, None] - node_positions[CH_indices], axis=2)
+        assigned_CH = np.argmin(dists, axis=1)
+    else:
+        assigned_CH = np.zeros(num_nodes, dtype=int)
+
+    delay_round = []
+    start_energy = node_energy.copy()
+
+    # ---- Energy Update ----
+    for i in range(num_nodes):
+        if node_energy[i] <= 0:
+            continue
+
+        if i in CH_indices:  # Cluster head
+            rx_cost = E_elec * packet_size * (num_nodes / max(num_CH, 1))
+            d_sink = np.linalg.norm(node_positions[i] - sink)
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_sink ** 2
+            total_cost = rx_cost + tx_cost
+            node_energy[i] = max(0, node_energy[i] - total_cost)
+            delay_round.append(1 + d_sink / 10)
+        else:  # Normal node
+            if num_CH > 0:
+                ch = CH_indices[assigned_CH[i]]
+                d_ch = np.linalg.norm(node_positions[i] - node_positions[ch])
+            else:
+                d_ch = np.linalg.norm(node_positions[i] - sink)
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_ch ** 2
+            node_energy[i] = max(0, node_energy[i] - tx_cost)
+            delay_round.append(1 + d_ch / 10)
+
+    # ---- Metrics ----
+    alive = np.sum(node_energy > 0)
+    energy_remain = np.sum(node_energy)
+    avg_delay = np.mean(delay_round) if delay_round else 0
+    total_throughput = alive * packet_size
+    energy_consumed = np.sum(start_energy - node_energy)
+
+    # ---- Coverage Before Healing ----
+    alive_nodes = node_positions[node_energy > 0]
+    coverage_before = np.array([is_covered(p, alive_nodes, sensing_radius) for p in grid_points])
+    holes_before = np.sum(~coverage_before)
+    ratio_before = (np.sum(coverage_before) / len(grid_points)) * 100
+
+    # ---- Healing ----
+    uncovered_points = grid_points[~coverage_before]
+    added_nodes = hcoa_node_placement(uncovered_points, sensing_radius, add_count=5)
+    healed_positions = np.vstack([alive_nodes, added_nodes]) if added_nodes.size > 0 else alive_nodes
+
+    coverage_after = np.array([is_covered(p, healed_positions, sensing_radius) for p in grid_points])
+    holes_after = np.sum(~coverage_after)
+    ratio_after = (np.sum(coverage_after) / len(grid_points)) * 100
+
+    # ---- Store Metrics ----
+    round_metrics.append({
+        'Round': r + 1,
+        'Alive Nodes': alive,
+        'CHs': num_CH,
+        'Avg Delay': avg_delay,
+        'Energy Left': energy_remain,
+        'Throughput': total_throughput,
+        'Energy Consumed': energy_consumed,
+        'Coverage Holes Before': holes_before,
+        'Coverage Ratio Before (%)': ratio_before,
+        'Coverage Holes After': holes_after,
+        'Coverage Ratio After (%)': ratio_after
+    })
+
+    if alive == 0:
+        break
+
+# ---------------- Save CSV ----------------
+csv_file = os.path.join(output_dir, "round_metrics.csv")
+with open(csv_file, "w", newline='') as f:
+    fieldnames = round_metrics[0].keys()
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(round_metrics)
+print(f"✅ Round metrics CSV saved: {csv_file}")
+
+# ---------------- Summary ----------------
+avg_throughput = np.mean([m['Throughput'] for m in round_metrics])
+avg_energy_consumed = np.mean([m['Energy Consumed'] for m in round_metrics])
+avg_delay = np.mean([m['Avg Delay'] for m in round_metrics])
+
+print("\n📊 OVERALL PERFORMANCE METRICS")
+print(f"📦 Average Throughput per Round: {avg_throughput:.2f} bits")
+print(f"⚡ Average Energy Consumed per Round: {avg_energy_consumed:.6f} J")
+print(f"⏱️ Average Delay per Round: {avg_delay:.4f} s")
+
+# ---------------- Plots ----------------
+rounds_arr = [m['Round'] for m in round_metrics]
+
+plt.figure()
+plt.plot(rounds_arr, [m['Alive Nodes'] for m in round_metrics], 'g-', label='Alive Nodes')
+plt.xlabel("Round"); plt.ylabel("Alive Nodes"); plt.title("Alive Nodes Over Rounds")
+plt.grid(True); plt.legend(); plt.show()
+
+plt.figure()
+plt.plot(rounds_arr, [m['Coverage Holes Before'] for m in round_metrics], 'r-', label='Before Healing')
+plt.plot(rounds_arr, [m['Coverage Holes After'] for m in round_metrics], 'b-', label='After Healing')
+plt.xlabel("Round"); plt.ylabel("Coverage Holes"); plt.title("Coverage Holes Before vs After")
+plt.grid(True); plt.legend(); plt.show()
+
+plt.figure()
+plt.plot(rounds_arr, [m['Coverage Ratio Before (%)'] for m in round_metrics], 'r-', label='Before Healing')
+plt.plot(rounds_arr, [m['Coverage Ratio After (%)'] for m in round_metrics], 'b-', label='After Healing')
+plt.xlabel("Round"); plt.ylabel("Coverage Ratio (%)"); plt.title("Coverage Ratio Before vs After")
+plt.grid(True); plt.legend(); plt.show()
