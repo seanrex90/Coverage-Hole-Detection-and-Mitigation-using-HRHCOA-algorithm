@@ -1,5 +1,9 @@
-Energy-Efficient Wireless Sensor Networks Through Coverage Hole Detection and Mitigation Using a Hybrid Raccoon–Hermit Crab Optimization Algorithm
-Authors : Sean Laurel Rex B R (Research Scholar, School of Electronics Engineering, VIT, vellore), Corresponding Author: Dr. Renuga Devi S (Professor, School of Electronics Engineering, VIT, Vellore)
+Energy-Efficient Wireless Sensor Networks Through Coverage Hole Detection and Mitigation Using a Hybrid Raccoon–Hermit Crab Optimization Algorithm.
+
+
+Authors : 
+Sean Laurel Rex B R (Research Scholar, School of Electronics Engineering, VIT, vellore), 
+Corresponding Author: Dr. Renuga Devi S (Professor, School of Electronics Engineering, VIT, Vellore)
 
 
 Operating a wireless sensor network with maximum coverage and maintaining prolonged network lifetime is a persistent challenge, 
