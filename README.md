@@ -1,3 +1,7 @@
+Energy-Efficient Wireless Sensor Networks Through Coverage Hole Detection and Mitigation Using a Hybrid Raccoon–Hermit Crab Optimization Algorithm
+Authors : Sean Laurel Rex B R (Research Scholar, School of Electronics Engineering, VIT, vellore), Corresponding Author: Dr. Renuga Devi S (Professor, School of Electronics Engineering, VIT, Vellore)
+
+
 Operating a wireless sensor network with maximum coverage and maintaining prolonged network lifetime is a persistent challenge, 
 where node failures, irregular deployment, and uneven energy consumption often lead to coverage holes, which reduce monitoring quality and network lifetime. 
 To ensure maximum coverage and an energy-efficient network, this work aims to propose a hybrid raccoon-hermit crab optimization algorithm for cluster head-based sensor networks, 
