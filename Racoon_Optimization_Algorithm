@@ -1,0 +1,337 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+import os
+
+# ------------------------ Parameters ------------------------
+field_size = 100
+num_nodes = 500
+sink = (50, 50)
+sensing_radius = 10
+comm_radius = 15
+rounds = 1500
+packet_size = 4000  # bits
+
+# Energy Model
+E_elec = 50e-9
+E_amp = 100e-12
+
+# Output directory
+output_dir = "wsn_rco_outputs"
+os.makedirs(output_dir, exist_ok=True)
+
+# ------------------------ Node Deployment ------------------------
+np.random.seed(50)
+node_positions = np.random.rand(num_nodes, 2) * field_size
+node_energy = np.full(num_nodes, 0.5)  # initial energy
+
+# ------------------------ Utility Functions ------------------------
+def is_covered(point, nodes, radius):
+    return np.any(np.linalg.norm(nodes - point, axis=1) <= radius)
+
+def detect_coverage_holes(nodes, radius, grid_res=5):
+    x = np.arange(0, field_size, grid_res)
+    y = np.arange(0, field_size, grid_res)
+    xx, yy = np.meshgrid(x, y)
+    grid_points = np.vstack((xx.ravel(), yy.ravel())).T
+    coverage = np.array([is_covered(p, nodes, radius) for p in grid_points])
+    holes = np.sum(~coverage)
+    return holes, coverage, grid_points
+
+def reposition_nodes(nodes, uncovered_points, max_move=2.0):
+    """Move nodes toward nearest uncovered points by max_move distance (RCO-style)."""
+    updated_nodes = nodes.copy()
+    if len(uncovered_points) == 0 or len(nodes) == 0:
+        return updated_nodes
+    for hole in uncovered_points:
+        dists = np.linalg.norm(updated_nodes - hole, axis=1)
+        idx = np.argmin(dists)
+        direction = hole - updated_nodes[idx]
+        dist = np.linalg.norm(direction)
+        if dist > 0:
+            step = direction / dist * min(max_move, dist)
+            updated_nodes[idx] += step
+            updated_nodes[idx] = np.clip(updated_nodes[idx], 0, field_size)
+    return updated_nodes
+
+# ------------------------ Initial Coverage ------------------------
+initial_holes, initial_coverage, grid_points = detect_coverage_holes(node_positions, sensing_radius)
+
+# ------------------------ Simulation Variables ------------------------
+round_metrics = []
+CH_lifetimes = {}
+CH_energy_usage = {}
+
+FND = None
+HND = None
+LND = None
+
+# Node death milestones
+milestones = {0.75: None, 0.50: None, 0.25: None}
+
+# ------------------------ Simulation Loop ------------------------
+for r in range(rounds):
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+
+    # Node death metrics
+    if FND is None and len(alive_idx) < num_nodes:
+        FND = r + 1
+    if HND is None and len(alive_idx) <= num_nodes * 0.5:
+        HND = r + 1
+    if LND is None and len(alive_idx) <= num_nodes * 0.1:
+        LND = r + 1
+
+    # RCO-style Cluster Head selection (probabilistic)
+    p = 0.1
+    is_CH = (np.random.rand(num_nodes) < p) & (node_energy > 0)
+    CH_indices = np.where(is_CH)[0]
+    num_CH = len(CH_indices)
+
+    # Assign nodes to nearest CH
+    if num_CH > 0:
+        dists = np.linalg.norm(node_positions[:, None] - node_positions[CH_indices], axis=2)
+        assigned_CH = np.argmin(dists, axis=1)
+    else:
+        assigned_CH = np.zeros(num_nodes, dtype=int)
+
+    delay_round = []
+    start_energy = node_energy.copy()
+
+    # ------------------------ Energy Updates ------------------------
+    for i in range(num_nodes):
+        if node_energy[i] <= 0:
+            continue
+
+        if is_CH[i]:
+            rx_cost = E_elec * packet_size * (num_nodes / num_CH) if num_CH else 0
+            d_sink = np.linalg.norm(node_positions[i] - sink)
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_sink ** 2
+            total_cost = rx_cost + tx_cost
+            node_energy[i] -= total_cost
+            delay_round.append(1 + d_sink / 10)
+
+            if i not in CH_lifetimes:
+                CH_lifetimes[i] = [r]
+                CH_energy_usage[i] = [total_cost]
+            else:
+                CH_lifetimes[i].append(r)
+                CH_energy_usage[i].append(total_cost)
+        else:
+            ch = CH_indices[assigned_CH[i]] if num_CH > 0 else 0
+            d_ch = np.linalg.norm(node_positions[i] - node_positions[ch])
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_ch ** 2
+            node_energy[i] -= tx_cost
+            delay_round.append(1 + d_ch / 10)
+
+    # ------------------------ Coverage Healing (RCO) ------------------------
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+
+    # Coverage holes before healing
+    holes_before, coverage_before, _ = detect_coverage_holes(alive_nodes, sensing_radius)
+    uncovered_points = grid_points[~coverage_before]
+    healed_nodes = reposition_nodes(alive_nodes, uncovered_points, max_move=2.0)
+    node_positions[alive_idx] = healed_nodes
+
+    # Coverage holes after healing
+    holes_after, coverage_after, _ = detect_coverage_holes(healed_nodes, sensing_radius)
+
+    # Save milestones
+    alive_ratio = len(alive_idx) / num_nodes
+    for ratio in milestones.keys():
+        if milestones[ratio] is None and alive_ratio <= ratio:
+            milestones[ratio] = {
+                'round': r + 1,
+                'holes_before': holes_before,
+                'holes_after': holes_after,
+                'coverage_after': coverage_after,
+                'nodes': healed_nodes.copy(),
+                'alive_nodes_idx': alive_idx.copy()
+            }
+
+    # ------------------------ Round Metrics ------------------------
+    alive = len(alive_idx)
+    energy_remain = np.sum(node_energy[node_energy > 0])
+    avg_delay = np.mean(delay_round) if delay_round else 0
+    total_throughput = alive * packet_size
+    energy_consumed = np.sum(start_energy - node_energy)
+
+    round_metrics.append({
+        'Round': r + 1,
+        'Alive Nodes': alive,
+        'CHs': num_CH,
+        'Avg Delay': avg_delay,
+        'Energy Left': energy_remain,
+        'Throughput': total_throughput,
+        'Energy Consumed': energy_consumed,
+        'Holes Before Healing': holes_before,
+        'Holes After Healing': holes_after
+    })
+
+    if alive == 0:
+        break
+
+if LND is None:
+    LND = rounds
+
+# ------------------------ Summary ------------------------
+print(f"Initial coverage holes: {initial_holes}")
+print(f"FND: {FND}, HND: {HND}, LND: {LND}")
+
+# ------------------------ CSV Outputs ------------------------
+# 1. Round Metrics
+round_file = os.path.join(output_dir, "round_metrics.csv")
+with open(round_file, "w", newline='') as f:
+    fieldnames = round_metrics[0].keys()
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(round_metrics)
+print(f"Round metrics CSV saved: {round_file}")
+
+# 2. Cluster Head Summary
+ch_file = os.path.join(output_dir, "ch_summary.csv")
+with open(ch_file, "w", newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(["Node", "Rounds Active", "Total Energy (J)"])
+    for ch, (times, energy) in zip(CH_lifetimes.keys(), zip(CH_lifetimes.values(), CH_energy_usage.values())):
+        writer.writerow([ch, len(times), sum(energy)])
+print(f"Cluster Head CSV saved: {ch_file}")
+
+# 3. Milestones Summary (holes before & after + coverage ratio)
+milestone_file = os.path.join(output_dir, "milestones.csv")
+with open(milestone_file, "w", newline='') as f:
+    fieldnames = [
+        "Milestone", "Round", "Alive Nodes",
+        "Coverage Holes Before Healing",
+        "Coverage Holes After Healing",
+        "Coverage Ratio (%)"
+    ]
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    total_grid_points = grid_points.shape[0]
+    for ratio, data in milestones.items():
+        if data is not None:
+            coverage_ratio = (np.sum(data['coverage_after']) / total_grid_points) * 100
+            writer.writerow({
+                "Milestone": f"{int((1-ratio)*100)}% Node Death",
+                "Round": data['round'],
+                "Alive Nodes": len(data['alive_nodes_idx']),
+                "Coverage Holes Before Healing": data['holes_before'],
+                "Coverage Holes After Healing": data['holes_after'],
+                "Coverage Ratio (%)": coverage_ratio
+            })
+print(f"Milestones CSV saved: {milestone_file}")
+
+# ------------------------ Plots ------------------------
+# Initial Deployment
+plt.figure(figsize=(6,6))
+plt.scatter(node_positions[:,0], node_positions[:,1], c='blue', label='Nodes')
+plt.scatter(*sink, c='red', marker='x', label='Sink')
+for node in node_positions:
+    circle = plt.Circle((node[0], node[1]), sensing_radius, color='lightblue', alpha=0.3)
+    plt.gca().add_patch(circle)
+plt.title("Node Deployment & Sensing Radius")
+plt.xlabel("X (m)")
+plt.ylabel("Y (m)")
+plt.legend()
+plt.grid(True)
+plt.axis('equal')
+plt.show()
+
+# Milestones plots
+for ratio, data in milestones.items():
+    if data is None:
+        continue
+    holes_coords = grid_points[~data['coverage_after']]
+    plt.figure(figsize=(6,6))
+    plt.scatter(holes_coords[:,0], holes_coords[:,1], c='red', s=15, label='Coverage Holes')
+    plt.scatter(data['nodes'][:,0], data['nodes'][:,1], c='green', marker='x', label='Healed Nodes')
+    for node in data['nodes']:
+        circle = plt.Circle((node[0], node[1]), sensing_radius, color='green', alpha=0.2)
+        plt.gca().add_patch(circle)
+    plt.title(f"Coverage After Healing at {int((1-ratio)*100)}% Node Death (Round {data['round']})")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+# Holes Over Rounds
+plt.figure(figsize=(8,4))
+plt.plot([m['Round'] for m in round_metrics], [m['Holes Before Healing'] for m in round_metrics], 'r-', label='Holes Before Healing')
+plt.plot([m['Round'] for m in round_metrics], [m['Holes After Healing'] for m in round_metrics], 'g-', label='Holes After Healing')
+plt.xlabel("Round")
+plt.ylabel("Number of Coverage Holes")
+plt.title("Coverage Holes Over Rounds")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Alive Nodes Over Rounds
+plt.figure(figsize=(8,4))
+plt.plot([m['Round'] for m in round_metrics], [m['Alive Nodes'] for m in round_metrics], 'b-')
+plt.xlabel("Round")
+plt.ylabel("Alive Nodes")
+plt.title("Alive Nodes Over Rounds")
+plt.grid(True)
+plt.show()
+
+# Energy Left Over Rounds
+plt.figure(figsize=(8,4))
+plt.plot([m['Round'] for m in round_metrics], [m['Energy Left'] for m in round_metrics], 'm-')
+plt.xlabel("Round")
+plt.ylabel("Energy Left (J)")
+plt.title("Total Energy Left Over Rounds")
+plt.grid(True)
+plt.show()
+
+# Throughput Over Rounds
+plt.figure(figsize=(8,4))
+plt.plot([m['Round'] for m in round_metrics], [m['Throughput'] for m in round_metrics], 'c-')
+plt.xlabel("Round")
+plt.ylabel("Throughput (bits)")
+plt.title("Throughput Over Rounds")
+plt.grid(True)
+plt.show()
+
+# ------------------------ Final Summary Metrics ------------------------
+total_rounds = round_metrics[-1]['Round'] if round_metrics else 0
+overall_throughput = sum(m['Throughput'] for m in round_metrics)
+avg_delay = np.mean([m['Avg Delay'] for m in round_metrics if m['Avg Delay'] > 0])
+avg_energy_consumed = np.mean([m['Energy Consumed'] for m in round_metrics])
+avg_holes_before = np.mean([m['Holes Before Healing'] for m in round_metrics])
+avg_holes_after = np.mean([m['Holes After Healing'] for m in round_metrics])
+coverage_reduction = (1 - (avg_holes_after / (avg_holes_before + 1e-9))) * 100
+
+# ---- Display in command window ----
+print("\n========== Simulation Summary ==========")
+print(f"Total Rounds Simulated    : {total_rounds}")
+print(f"FND (First Node Dead)     : {FND}")
+print(f"HND (Half Nodes Dead)     : {HND}")
+print(f"LND (Last Node Dead)      : {LND}")
+print(f"Overall Throughput (bits) : {overall_throughput}")
+print(f"Average Delay per Round   : {avg_delay:.4f}")
+print(f"Average Energy Consumed   : {avg_energy_consumed:.6f} J")
+print(f"Avg Coverage Holes Before : {avg_holes_before:.2f}")
+print(f"Avg Coverage Holes After  : {avg_holes_after:.2f}")
+print(f"Coverage Hole Reduction   : {coverage_reduction:.2f}%")
+print("=======================================\n")
+
+# ---- Append to CSV as footer ----
+summary_file = os.path.join(output_dir, "round_metrics.csv")
+with open(summary_file, "a", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([])
+    writer.writerow(["===== Simulation Summary ====="])
+    writer.writerow(["Total Rounds", total_rounds])
+    writer.writerow(["FND (First Node Dead)", FND])
+    writer.writerow(["HND (Half Nodes Dead)", HND])
+    writer.writerow(["LND (Last Node Dead)", LND])
+    writer.writerow(["Overall Throughput (bits)", overall_throughput])
+    writer.writerow(["Average Delay per Round", avg_delay])
+    writer.writerow(["Average Energy Consumed (J)", avg_energy_consumed])
+    writer.writerow(["Avg Coverage Holes Before", avg_holes_before])
+    writer.writerow(["Avg Coverage Holes After", avg_holes_after])
+writer.writerow(["Coverage Hole Reduction (%)", coverage_reduction])
