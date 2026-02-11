@@ -1,0 +1,356 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+
+# ------------------------ Parameters ------------------------
+field_size = 100
+num_nodes = 200
+sink = (50, 50)
+sensing_radius = 10
+comm_radius = 15
+rounds = 1500
+packet_size = 4000  # bits
+
+# Energy Model
+E_elec = 50e-9
+E_amp = 100e-12
+
+# ------------------------ Node Deployment ------------------------
+np.random.seed(50)
+node_positions = np.random.rand(num_nodes, 2) * field_size
+node_energy = np.full(num_nodes, 0.5)  # initial energy
+
+# ------------------------ Utility Functions ------------------------
+
+def is_covered(point, nodes, radius):
+    return np.any(np.linalg.norm(nodes - point, axis=1) <= radius)
+
+def detect_coverage_holes(nodes, radius, grid_res=5):
+    x = np.arange(0, field_size, grid_res)
+    y = np.arange(0, field_size, grid_res)
+    xx, yy = np.meshgrid(x, y)
+    grid_points = np.vstack((xx.ravel(), yy.ravel())).T
+    coverage = np.array([is_covered(p, nodes, radius) for p in grid_points], dtype=bool)
+    holes = np.sum(~coverage)
+    return holes, coverage, grid_points
+
+# ------------------------ Fitness ------------------------
+
+def fitness_coverage(nodes, radius, grid_points):
+    coverage = np.array([is_covered(p, nodes, radius) for p in grid_points], dtype=bool)
+    return np.sum(~coverage)  # minimize uncovered points
+
+# ------------------------ ROA (Racoon Optimization Algorithm) ------------------------
+
+def ROA_global_search(nodes, grid_points, radius, pop_size=10, max_iters=3):
+    """Global search phase - population of node positions."""
+    num_nodes = nodes.shape[0]
+    population = np.array([nodes.copy() for _ in range(pop_size)])
+    fitness = np.zeros(pop_size)
+
+    # Evaluate initial fitness
+    for i in range(pop_size):
+        fitness[i] = fitness_coverage(population[i], radius, grid_points)
+
+    best_idx = np.argmin(fitness)
+    best_solution = population[best_idx].copy()
+    best_fitness = fitness[best_idx]
+
+    for _ in range(max_iters):
+        for i in range(pop_size):
+            new_sol = population[i].copy()
+            # Random walk - move some nodes randomly
+            for j in range(num_nodes):
+                if np.random.rand() < 0.3:
+                    step = (np.random.rand(2) - 0.5) * 6  # max 3 meters move
+                    new_sol[j] = np.clip(new_sol[j] + step, 0, field_size)
+
+            new_fit = fitness_coverage(new_sol, radius, grid_points)
+            if new_fit < fitness[i]:
+                population[i] = new_sol
+                fitness[i] = new_fit
+                if new_fit < best_fitness:
+                    best_solution = new_sol.copy()
+                    best_fitness = new_fit
+
+    return best_solution
+
+# ------------------------ HCO (Hermit Crab Optimization) ------------------------
+
+def HCO_local_tuning(nodes, grid_points, radius, max_iters=5):
+    crab_positions = nodes.copy()
+    num_crabs = crab_positions.shape[0]
+
+    for iteration in range(max_iters):
+        for i in range(num_crabs):
+            current_pos = crab_positions[i].copy()
+            current_nodes = crab_positions.copy()
+
+            # Small random move (max 2 meters)
+            move = (np.random.rand(2) - 0.5) * 4
+            new_pos = np.clip(current_pos + move, 0, field_size)
+
+            # Try swapping with another crab (shell exchange)
+            swap_idx = np.random.randint(num_crabs)
+            if swap_idx != i:
+                temp_nodes = crab_positions.copy()
+                temp_nodes[i], temp_nodes[swap_idx] = temp_nodes[swap_idx].copy(), temp_nodes[i].copy()
+
+                fitness_swap = fitness_coverage(temp_nodes, radius, grid_points)
+                fitness_current = fitness_coverage(crab_positions, radius, grid_points)
+
+                if fitness_swap < fitness_current:
+                    crab_positions = temp_nodes
+                    continue
+
+            # Try the move
+            temp_nodes = crab_positions.copy()
+            temp_nodes[i] = new_pos
+            fitness_new = fitness_coverage(temp_nodes, radius, grid_points)
+            fitness_current = fitness_coverage(crab_positions, radius, grid_points)
+
+            if fitness_new < fitness_current:
+                crab_positions[i] = new_pos
+
+    return crab_positions
+
+# ------------------------ Hybrid Optimization (ROA + HCO) ------------------------
+
+def hybrid_optimize(nodes, grid_points, radius, global_iters=3, local_iters=5):
+    # Global search using ROA
+    global_best = ROA_global_search(nodes, grid_points, radius, max_iters=global_iters)
+    # Local tuning using HCO
+    local_best = HCO_local_tuning(global_best, grid_points, radius, max_iters=local_iters)
+    return local_best
+
+# ------------------------ Initial Coverage ------------------------
+initial_holes, initial_coverage, grid_points = detect_coverage_holes(node_positions, sensing_radius)
+
+# ------------------------ Simulation Variables ------------------------
+round_metrics = []
+CH_lifetimes = {}
+CH_energy_usage = {}
+
+FND = None
+HND = None
+LND = None
+
+milestones = {
+    0.75: None,  # 25% death (alive 75%)
+    0.50: None,  # 50% death
+    0.25: None   # 75% death
+}
+
+# ------------------------ Simulation Loop ------------------------
+for r in range(rounds):
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+
+    if FND is None and len(alive_idx) < num_nodes:
+        FND = r + 1
+    if HND is None and len(alive_idx) <= num_nodes * 0.5:
+        HND = r + 1
+    if LND is None and len(alive_idx) <= num_nodes * 0.1:
+        LND = r + 1
+
+    # LEACH protocol round
+    p = 0.1
+    is_CH = (np.random.rand(num_nodes) < p) & (node_energy > 0)
+    CH_indices = np.where(is_CH)[0]
+    num_CH = len(CH_indices)
+
+    if num_CH > 0:
+        dists = np.linalg.norm(node_positions[:, None] - node_positions[CH_indices], axis=2)
+        assigned_CH = np.argmin(dists, axis=1)
+    else:
+        assigned_CH = np.zeros(num_nodes, dtype=int)
+
+    delay_round = []
+    start_energy = node_energy.copy()
+
+    for i in range(num_nodes):
+        if node_energy[i] <= 0:
+            continue
+
+        if is_CH[i]:
+            rx_cost = E_elec * packet_size * (num_nodes / num_CH) if num_CH else 0
+            d_sink = np.linalg.norm(node_positions[i] - sink)
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_sink ** 2
+            total_cost = rx_cost + tx_cost
+            node_energy[i] -= total_cost
+            delay_round.append(1 + d_sink / 10)
+
+            if i not in CH_lifetimes:
+                CH_lifetimes[i] = [r]
+                CH_energy_usage[i] = [total_cost]
+            else:
+                CH_lifetimes[i].append(r)
+                CH_energy_usage[i].append(total_cost)
+        else:
+            ch = CH_indices[assigned_CH[i]] if num_CH > 0 else 0
+            d_ch = np.linalg.norm(node_positions[i] - node_positions[ch])
+            tx_cost = E_elec * packet_size + E_amp * packet_size * d_ch ** 2
+            node_energy[i] -= tx_cost
+            delay_round.append(1 + d_ch / 10)
+
+    # Recalculate alive nodes after energy update
+    alive_idx = np.where(node_energy > 0)[0]
+    alive_nodes = node_positions[alive_idx]
+
+    # Detect coverage holes before healing
+    holes_before, coverage_before, _ = detect_coverage_holes(alive_nodes, sensing_radius)
+
+    # Identify uncovered grid points for healing
+    uncovered_points = grid_points[~coverage_before]
+
+    # Heal using Hybrid optimization
+    if len(alive_nodes) > 0 and len(uncovered_points) > 0:
+        healed_nodes = hybrid_optimize(alive_nodes, uncovered_points, sensing_radius)
+        node_positions[alive_idx] = healed_nodes
+    else:
+        healed_nodes = alive_nodes.copy()
+
+    # Detect coverage holes after healing
+    holes_after, coverage_after, _ = detect_coverage_holes(healed_nodes, sensing_radius)
+
+    # Save healing snapshot at death milestones
+    alive_ratio = len(alive_idx) / num_nodes
+    for ratio in milestones.keys():
+        if milestones[ratio] is None and alive_ratio <= ratio:
+            milestones[ratio] = {
+                'round': r + 1,
+                'holes_after': holes_after,
+                'coverage_after': coverage_after,
+                'nodes': healed_nodes.copy(),
+                'alive_nodes_idx': alive_idx.copy()
+            }
+
+    alive = len(alive_idx)
+    energy_remain = np.sum(node_energy[node_energy > 0])
+    avg_delay = np.mean(delay_round) if delay_round else 0
+    total_throughput = alive * packet_size
+    energy_consumed = np.sum(start_energy - node_energy)
+
+    round_metrics.append({
+        'Round': r + 1,
+        'Alive Nodes': alive,
+        'CHs': num_CH,
+        'Avg Delay': avg_delay,
+        'Energy Left': energy_remain,
+        'Throughput': total_throughput,
+        'Energy Consumed': energy_consumed,
+        'Holes Before Healing': holes_before,
+        'Holes After Healing': holes_after
+    })
+
+    if alive == 0:
+        break
+
+if LND is None:
+    LND = rounds
+
+# ------------------------ Summary ------------------------
+
+print(f"Initial coverage holes before HRHCOA: {initial_holes}")
+print(f"First Node Death (FND): Round {FND}")
+print(f"Half Nodes Death (HND): Round {HND}")
+print(f"Last Node Death (LND): Round {LND}")
+
+ch_lifetime_summary = {
+    ch: {'Rounds Active': len(times), 'Total Energy': sum(energy)}
+    for ch, (times, energy) in zip(CH_lifetimes.keys(), zip(CH_lifetimes.values(), CH_energy_usage.values()))
+}
+
+print("\nCluster Head Lifetime & Energy Usage:")
+for ch, data in ch_lifetime_summary.items():
+    print(f" - Node {ch}: {data['Rounds Active']} rounds, {data['Total Energy']:.6f} J")
+
+# ------------------------ Save CSV ------------------------
+
+csv_filename = "wsn_hybrid_roa_hco_metrics.csv"
+with open(csv_filename, mode='w', newline='') as file:
+    writer = csv.DictWriter(file, fieldnames=round_metrics[0].keys())
+    writer.writeheader()
+    for row in round_metrics:
+        writer.writerow(row)
+
+print(f"\nSaved metrics to {csv_filename}")
+
+# ------------------------ Print round metrics ------------------------
+print("\nRound | Alive Nodes | CHs | Avg Delay | Energy Left (J) | Throughput | Energy Consumed | Holes Before | Holes After")
+print("-" * 110)
+for m in round_metrics:
+    print(f"{m['Round']:5} | {m['Alive Nodes']:11} | {m['CHs']:3} | {m['Avg Delay']:.4f}    | "
+          f"{m['Energy Left']:.4f}         | {m['Throughput']:10} | {m['Energy Consumed']:.6f} | "
+          f"{m['Holes Before Healing']:12} | {m['Holes After Healing']:11}")
+
+# ------------------------ Plots ------------------------
+
+# Initial Deployment & Sensing Radius
+plt.figure(figsize=(6,6))
+plt.scatter(node_positions[:, 0], node_positions[:, 1], c='blue', label='Nodes')
+plt.scatter(*sink, c='red', marker='x', label='Sink')
+for node in node_positions:
+    circle = plt.Circle((node[0], node[1]), sensing_radius, color='lightblue', alpha=0.3)
+    plt.gca().add_patch(circle)
+plt.title("Deployment & Sensing Radius")
+plt.xlabel("X (m)")
+plt.ylabel("Y (m)")
+plt.legend()
+plt.grid(True)
+plt.axis('equal')
+plt.show()
+
+# Plot Healing Milestones
+for ratio, data in milestones.items():
+    if data is None:
+        print(f"Milestone {int((1-ratio)*100)}% node death not reached.")
+        continue
+
+    holes_coords = grid_points[~data['coverage_after']]
+    plt.figure(figsize=(6,6))
+    plt.scatter(holes_coords[:, 0], holes_coords[:, 1], c='red', s=15, label='Coverage Holes')
+    plt.scatter(data['nodes'][:, 0], data['nodes'][:, 1], c='green', marker='x', label='Healed Nodes')
+    for node in data['nodes']:
+        circle = plt.Circle((node[0], node[1]), sensing_radius, color='green', alpha=0.2)
+        plt.gca().add_patch(circle)
+    plt.title(f"Healing at {int((1-ratio)*100)}% Node Death (Round {data['round']})")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+# ------------------------ Final Summary Table ------------------------
+total_rounds = round_metrics[-1]['Round'] if round_metrics else 0
+
+overall_throughput = sum(m['Throughput'] for m in round_metrics)
+avg_throughput = overall_throughput / total_rounds if total_rounds > 0 else 0
+
+avg_delay = np.mean([m['Avg Delay'] for m in round_metrics]) if round_metrics else 0
+
+overall_energy_consumed = sum(m['Energy Consumed'] for m in round_metrics)
+avg_energy_consumed = overall_energy_consumed / total_rounds if total_rounds > 0 else 0
+
+avg_cov_before = np.mean([m['Holes Before Healing'] for m in round_metrics])
+avg_cov_after = np.mean([m['Holes After Healing'] for m in round_metrics])
+coverage_ratio_before = 100 * (1 - avg_cov_before / len(grid_points))
+coverage_ratio_after = 100 * (1 - avg_cov_after / len(grid_points))
+
+print("\n==================== SIMULATION SUMMARY ====================")
+print(f" Total Rounds                : {total_rounds}")
+print(f" First Node Dead (FND)       : {FND}")
+print(f" Half Nodes Dead (HND)       : {HND}")
+print(f" Last Node Dead (LND)        : {LND}")
+print("-------------------------------------------------------------")
+print(f" Overall Throughput (bits)   : {overall_throughput}")
+print(f" Average Throughput (bits)   : {avg_throughput:.2f}")
+print(f" Average Delay               : {avg_delay:.4f}")
+print("-------------------------------------------------------------")
+print(f" Coverage Ratio Before Heal  : {coverage_ratio_before:.2f}%")
+print(f" Coverage Ratio After Heal   : {coverage_ratio_after:.2f}%")
+print("-------------------------------------------------------------")
+print(f" Overall Energy Consumed (J) : {overall_energy_consumed:.6f}")
+print(f" Avg Energy Consumed / Round : {avg_energy_consumed:.6f}")
+print("=============================================================")
+
